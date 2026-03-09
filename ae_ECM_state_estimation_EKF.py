@@ -1,16 +1,6 @@
 #A:E ECM STATE ESTIMATION EKF
 #model:
 
-
-#Akhat
-#Bkhat
-#Ckhat
-#Dkhat
-
-
-#TODO(CP): Check that current sign is handled correctly (discharge is negative)
-#TODO(CP): Check that capacity Q is in Ah everywhere (also for the lookups)
-
 from pyexpat import model
 
 import numpy as np
@@ -38,6 +28,7 @@ def initEKF(SOC0, SigmaX0, SigmaV, SigmaW, model_params, model_props):
     # get calculated from the first voltage measurement using the OCV curve (Assuming that that first voltage measuerement is the fully relaxed cell voltage (OCV))
     #The following function would get implemented. 
     #SOC0 = SOCfromOCVtemp(v0, T0, model) 
+    SOC0 = SOC0-0.3
 
     ekfData['zkInd'] = 3
 
@@ -119,9 +110,6 @@ def iterEKF(vk, ik, Tk, deltat, ekfData):
     C2 = getParamECM('C_C2_F', Tk, zk, model_params)
     R0 = getParamECM('R_R0_Ohm', Tk, zk, model_params)
     G = getParamECM('gamma', Tk, zk, model_params)
-    OCVdch = getParamECM('E_OCV_dch_V', Tk, zk, model_params)
-    OCVch = getParamECM('E_OCV_ch_V', Tk, zk, model_params)
-    OCV = ((1+hk)/2)*OCVch + ((1-hk)/2)*OCVdch
 
     R1C1 = np.exp(-deltat / (R1 * C1))
     R2C2 = np.exp(-deltat / (R2 * C2))
@@ -142,9 +130,9 @@ def iterEKF(vk, ik, Tk, deltat, ekfData):
 
     #NOTE(CP): As long as the current is not negligible (less than C/100), we will use its sign. 
     # Otherwise, we will just assume the current is zero and not use its sign, to avoid noise causing sign flips.
-    if abs(ik) > Q / 100: 
-        ekfData['signIk'] = np.sign(ik)
-    signIk = ekfData['signIk']
+    # if abs(ik) > Q / 100: 
+    #     ekfData['signIk'] = np.sign(ik)
+    # signIk = ekfData['signIk']
 
     # EKF Step 0: Compute Ahat[k-1], Bhat[k-1]
     nx = len(xhat)
@@ -163,11 +151,27 @@ def iterEKF(vk, ik, Tk, deltat, ekfData):
     Ah = np.exp(-abs(I * G * deltat / (3600 * Q)))  # hysteresis factor
     Ahat[hkInd, hkInd] = Ah
     B = np.hstack((Bhat, 0 * Bhat))
-    Bhat[hkInd, 0] = -abs(G * deltat / (3600 * Q)) * Ah * (1 + np.sign(I) * xhat[hkInd, 0])
+    Bhat[hkInd, 0] = -abs(G * deltat / (3600 * Q)) * Ah * (1 - np.sign(I) * xhat[hkInd, 0])
     B[hkInd, 1] = Ah - 1
 
     # Step 1a: State estimate time update
     xhat = Ahat @ xhat + B @ np.array([[I], [np.sign(I)]])
+
+    zk = xhat[zkInd, 0]
+    hk = xhat[hkInd, 0]
+
+    # Load the cell model parameters
+    Q = getPropECM('Qnom_Ah', model_props)
+    R1 = getParamECM('R_R1_Ohm', Tk, zk, model_params)
+    C1 = getParamECM('C_C1_F', Tk, zk, model_params)
+    R2 = getParamECM('R_R2_Ohm', Tk, zk, model_params)
+    C2 = getParamECM('C_C2_F', Tk, zk, model_params)
+    R0 = getParamECM('R_R0_Ohm', Tk, zk, model_params)
+    G = getParamECM('gamma', Tk, zk, model_params)
+   
+
+    R1C1 = np.exp(-deltat / (R1 * C1))
+    R2C2 = np.exp(-deltat / (R2 * C2))
 
     # Step 1b: Error covariance time update
     # sigmaminus(k) = Ahat(k-1)*sigmaplus(k-1)*Ahat(k-1)' + ...
@@ -175,11 +179,14 @@ def iterEKF(vk, ik, Tk, deltat, ekfData):
     SigmaX = Ahat @ SigmaX @ Ahat.T + Bhat @ np.atleast_2d(SigmaW) @ Bhat.T if np.ndim(SigmaW) > 0 else Ahat @ SigmaX @ Ahat.T + Bhat * SigmaW * Bhat.T
 
     # Step 1c: Output estimate
+    OCVdch = getParamECM('E_OCV_dch_V', Tk, zk, model_params)
+    OCVch = getParamECM('E_OCV_ch_V', Tk, zk, model_params)
+    OCV = ((1+hk)/2)*OCVch + ((1-hk)/2)*OCVdch
     yhat = (
         OCV
         - float(R1) * xhat[ir1Ind, 0]
         - float(R2) * xhat[ir2Ind, 0]
-        - R0 * ik
+        - R0 * I
     )
 
     # Step 2a: Estimator gain matrix
@@ -201,8 +208,9 @@ def iterEKF(vk, ik, Tk, deltat, ekfData):
     xhat[hkInd, 0] = min(1, max(-1, xhat[hkInd, 0]))  # Help maintain robustness
     xhat[zkInd, 0] = min(1.05, max(-0.05, xhat[zkInd, 0]))
 
-    # Step 2c: Error covariance measurement update
-    SigmaX = SigmaX - L @ SigmaY @ L.T
+    # Step 2c: Error covariance measurement update (Joseph form)
+    I4 = np.eye(nx)
+    SigmaX = (I4 - L @ Chat) @ SigmaX @ (I4 - L @ Chat).T + L * SigmaV * L.T
 
     # % Q-bump code
     if r**2 > 4 * SigmaY:  # bad voltage estimate by 2 std. devs, bump Q
@@ -224,7 +232,6 @@ def iterEKF(vk, ik, Tk, deltat, ekfData):
 
     return zk, zkbnd, ekfData
 
-
 # load CellModel % loads "model" of cell
 cell_props = 'Molicel_INR-21700-P45B_cellprops_2.2.csv'
 cell_params = 'Molicel_INR-21700-P45B_ECM_2.2.csv'
@@ -243,7 +250,7 @@ data = data.iloc[::30, :].reset_index(drop=True)
 time = data['t_s'].to_numpy()
 deltat = time[1] - time[0]
 time = time - time[0]  # start time at 0
-current = data['I_exp_A'].to_numpy()  # discharge > 0; charge < 0.
+current = -data['I_exp_A'].to_numpy()  # flip current sign so discharge < 0; charge > 0.
 voltage = data['V_exp_V'].to_numpy()
 temperature = data['T_exp_degC'].to_numpy()
 soc = data['SOC'].to_numpy()
