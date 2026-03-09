@@ -175,7 +175,6 @@ def iterEKF(vk, ik, Tk, deltat, ekfData):
     SigmaX = Ahat @ SigmaX @ Ahat.T + Bhat @ np.atleast_2d(SigmaW) @ Bhat.T if np.ndim(SigmaW) > 0 else Ahat @ SigmaX @ Ahat.T + Bhat * SigmaW * Bhat.T
 
     # Step 1c: Output estimate
-
     yhat = (
         OCV
         - float(R1) * xhat[ir1Ind, 0]
@@ -186,7 +185,7 @@ def iterEKF(vk, ik, Tk, deltat, ekfData):
     # Step 2a: Estimator gain matrix
     Chat = np.zeros((1, nx))
     Chat[0, zkInd] = dOCVfromSOCtemp(zk, Tk, model_params, 'E_OCV_ch_V') * (1+hk)/2 + dOCVfromSOCtemp(zk, Tk, model_params, 'E_OCV_dch_V') * (1-hk)/2
-    Chat[0, hkInd] = 0.5 * (OCVdch - OCVch)
+    Chat[0, hkInd] = 0.5 * (OCVch - OCVdch)
     Chat[0, ir1Ind] = -float(R1)
     Chat[0, ir2Ind] = -float(R2)
 
@@ -239,7 +238,7 @@ data_file = 'MOLICEL_P45B_079_025degC_DC_WLTP_5C_Dch_1p5C_Ch_validation.csv'
 data = pd.read_csv(working_dir + '/' + data_file)  # loads data from cell test
 
 #downsample data for faster processing (optional)
-data = data.iloc[::10, :].reset_index(drop=True)
+data = data.iloc[::30, :].reset_index(drop=True)
 
 time = data['t_s'].to_numpy()
 deltat = time[1] - time[0]
