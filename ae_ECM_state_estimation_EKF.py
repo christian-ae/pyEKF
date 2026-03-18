@@ -28,7 +28,7 @@ def initEKF(SOC0, SigmaX0, SigmaV, SigmaW, model_params, model_props):
     # get calculated from the first voltage measurement using the OCV curve (Assuming that that first voltage measuerement is the fully relaxed cell voltage (OCV))
     #The following function would get implemented. 
     #SOC0 = SOCfromOCVtemp(v0, T0, model) 
-    SOC0 = SOC0-0.3
+    SOC0 = SOC0-0.3 #NOTE(CP): Test an offset in initial SOC
 
     ekfData['zkInd'] = 3
 
@@ -242,10 +242,13 @@ model_params = pd.read_csv(working_dir + '/' + cell_params)
 # Load cell-test data. Contains variable "DYNData" of which the field
 # "script1" is of interest. It has sub-fields time, current, voltage, soc.
 data_file = 'MOLICEL_P45B_079_025degC_DC_WLTP_5C_Dch_1p5C_Ch_validation.csv'
+#data_file = 'MOLICEL-INR21700-P45B_019_Aging_Block_004_0.csv'
+#data_file = 'MOLICEL-INR21700-P45B_019_Aging_Block_004_0 - shortened.csv' 
+#data_file = 'MOLICEL-INR21700-P45B_019_Aging_Block_004_0 - shortened - shortened.csv'
 data = pd.read_csv(working_dir + '/' + data_file)  # loads data from cell test
 
 #downsample data for faster processing (optional)
-data = data.iloc[::30, :].reset_index(drop=True)
+data = data.iloc[::10, :].reset_index(drop=True)
 
 time = data['t_s'].to_numpy()
 deltat = time[1] - time[0]
