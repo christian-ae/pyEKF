@@ -1,57 +1,44 @@
-#A:E ECM STATE ESTIMATION EKF
-#model:
-
-from pyexpat import model
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import os
 from tqdm import tqdm
-from scipy.interpolate import RegularGridInterpolator
 
 
 def initEKF(SOC0, SigmaX0, SigmaV, SigmaW, model_params, model_props):
-    #We assume the cell is at rest initially with neutral hysteresis state 
-    
-    # Initial state description
-    ir1_0 = 0 # Initial current through R1. We assume the cell is at rest, so this is zero.
-    ir2_0 = 0 # Initial current through R2. We assume the cell is at rest, so this is zero.
     ekfData = {}
-    ekfData['ir1Ind'] = 0
-    ekfData['ir2Ind'] = 1
 
-    hk0 = 0
-    ekfData['hkInd'] = 2
+    # State indices for x = [SOC, h, V1, V2]^T
+    ekfData["socInd"] = 0
+    ekfData["hInd"] = 1
+    ekfData["v1Ind"] = 2
+    ekfData["v2Ind"] = 3
 
-    #NOTE(CP): In a real implementation initial SOC0 would either have to be based on prior knowledge or 
-    # get calculated from the first voltage measurement using the OCV curve (Assuming that that first voltage measuerement is the fully relaxed cell voltage (OCV))
-    #The following function would get implemented. 
-    #SOC0 = SOCfromOCVtemp(v0, T0, model) 
-    SOC0 = SOC0-0.3 #NOTE(CP): Test an offset in initial SOC
+    # Initial state: neutral hysteresis, relaxed RC voltages
+    h0 = 0.0
+    V10 = 0.0
+    V20 = 0.0
 
-    ekfData['zkInd'] = 3
+    # Optional initial SOC offset for testing
+    SOC0 = SOC0 - 0.1
 
-    ekfData['xhat'] = np.array([ir1_0, ir2_0, hk0, SOC0]).reshape(-1, 1)  # initial state
+    ekfData["xhat"] = np.array([SOC0, h0, V10, V20], dtype=float).reshape(-1, 1)
 
-    # Covariance values
-    ekfData['SigmaX'] = SigmaX0
-    ekfData['SigmaV'] = SigmaV
-    ekfData['SigmaW'] = SigmaW
-    ekfData['Qbump'] = 5 #How much we want to increase the uncertainty when we get a really bad measurement (several in a row)
+    ekfData["SigmaX"] = SigmaX0
+    ekfData["SigmaV"] = SigmaV
+    ekfData["SigmaW"] = SigmaW
+    ekfData["Qbump"] = 5.0
 
-    # previous value of current
-    ekfData['priorI'] = 0
-    ekfData['signIk'] = 0
-
-    # store model data structure too
-    ekfData['model_params'] = model_params
-    ekfData['model_props'] = model_props
+    ekfData["priorI"] = 0.0
+    ekfData["model_params"] = model_params
+    ekfData["model_props"] = model_props
 
     return ekfData
 
+
 def getPropECM(propName, model_props):
     return model_props[propName].iloc[0]
+
 
 def getParamECM(paramName, T, z, model_params):
     Ts = np.sort(model_params["T_degC"].unique())
@@ -67,6 +54,7 @@ def getParamECM(paramName, T, z, model_params):
 
     return float(np.interp(T, Ts, vals))
 
+
 def dOCVfromSOCtemp(z, T, model_params, OCVparam):
     Ts = np.sort(model_params["T_degC"].unique())
     T = np.clip(T, Ts[0], Ts[-1])
@@ -80,239 +68,239 @@ def dOCVfromSOCtemp(z, T, model_params, OCVparam):
         soc = sub["SOC"].to_numpy()
         ocv = sub[OCVparam].to_numpy()
 
-        # Remove duplicate SOC values if present
         soc, idx = np.unique(soc, return_index=True)
         ocv = ocv[idx]
 
-        # Gradient dOCV/dSOC for this temperature slice
         docvdz = np.gradient(ocv, soc)
-
-        # Hold nearest gradient outside SOC range
         z0 = np.clip(z, soc[0], soc[-1])
         vals.append(np.interp(z0, soc, docvdz))
 
-    # Interpolate gradient across temperature
     return float(np.interp(T, Ts, vals))
 
+
+def ocv_from_soc_h(z, h, T, model_params):
+    OCVdch = getParamECM("E_OCV_dch_V", T, z, model_params)
+    OCVch = getParamECM("E_OCV_ch_V", T, z, model_params)
+    OCV = 0.5 * (1 + h) * OCVch + 0.5 * (1 - h) * OCVdch
+    return OCV, OCVch, OCVdch
+
+
 def iterEKF(vk, ik, Tk, deltat, ekfData):
-    model_params = ekfData['model_params']
-    model_props = ekfData['model_props']
+    model_params = ekfData["model_params"]
+    model_props = ekfData["model_props"]
 
-    #Current state of charge estimate for looking up model parameters
-    zk = ekfData['xhat'][ekfData['zkInd'], 0] 
-    hk = ekfData['xhat'][ekfData['hkInd'], 0]
-   
-    # Load the cell model parameters
-    Q = getPropECM('Qnom_Ah', model_props)
-    R1 = getParamECM('R_R1_Ohm', Tk, zk, model_params)
-    C1 = getParamECM('C_C1_F', Tk, zk, model_params)
-    R2 = getParamECM('R_R2_Ohm', Tk, zk, model_params)
-    C2 = getParamECM('C_C2_F', Tk, zk, model_params)
-    R0 = getParamECM('R_R0_Ohm', Tk, zk, model_params)
-    G = getParamECM('gamma', Tk, zk, model_params)
+    xhat = ekfData["xhat"]
+    SigmaX = ekfData["SigmaX"]
+    SigmaV = ekfData["SigmaV"]
+    SigmaW = ekfData["SigmaW"]
 
-    R1C1 = np.exp(-deltat / (R1 * C1))
-    R2C2 = np.exp(-deltat / (R2 * C2))
+    socInd = ekfData["socInd"]
+    hInd = ekfData["hInd"]
+    v1Ind = ekfData["v1Ind"]
+    v2Ind = ekfData["v2Ind"]
 
-    #TODO: CHeck your matrices are correct for RC!!
-    #TODO: Check sign conventions!!
+    # Use previous current for state propagation, same as your original structure
+    I = ekfData["priorI"]
 
-    # Get data stored in ekfData structure
-    I = ekfData['priorI']
-    SigmaX = ekfData['SigmaX']
-    SigmaV = ekfData['SigmaV']
-    SigmaW = ekfData['SigmaW']
-    xhat = ekfData['xhat']
-    ir1Ind = ekfData['ir1Ind']
-    ir2Ind = ekfData['ir2Ind']
-    hkInd = ekfData['hkInd']
-    zkInd = ekfData['zkInd']
+    soc = float(xhat[socInd, 0])
+    h = float(xhat[hInd, 0])
 
-    #NOTE(CP): As long as the current is not negligible (less than C/100), we will use its sign. 
-    # Otherwise, we will just assume the current is zero and not use its sign, to avoid noise causing sign flips.
-    # if abs(ik) > Q / 100: 
-    #     ekfData['signIk'] = np.sign(ik)
-    # signIk = ekfData['signIk']
+    # Model parameters at current estimated SOC
+    Q_Ah = getPropECM("Qnom_Ah", model_props)
+    Q_As = 3600.0 * Q_Ah
 
-    # EKF Step 0: Compute Ahat[k-1], Bhat[k-1]
-    nx = len(xhat)
-    Ahat = np.zeros((nx, nx))
-    Bhat = np.zeros((nx, 1))
+    R0 = getParamECM("R_R0_Ohm", Tk, soc, model_params)
+    R1 = getParamECM("R_R1_Ohm", Tk, soc, model_params)
+    C1 = getParamECM("C_C1_F", Tk, soc, model_params)
+    R2 = getParamECM("R_R2_Ohm", Tk, soc, model_params)
+    C2 = getParamECM("C_C2_F", Tk, soc, model_params)
+    gamma = getParamECM("gamma", Tk, soc, model_params)
 
-    Ahat[zkInd, zkInd] = 1
-    Bhat[zkInd, 0] = -deltat / (3600 * Q)
+    tau1 = R1 * C1
+    tau2 = R2 * C2
 
-    Ahat[ir1Ind, ir1Ind] = R1C1
-    Bhat[ir1Ind, 0] = (1 - R1C1)
+    # Exact discrete-time matrices for x = [SOC, h, V1, V2]^T
+    a_h = np.exp(-gamma * abs(I) * deltat / Q_As)
+    a1 = np.exp(-deltat / tau1)
+    a2 = np.exp(-deltat / tau2)
 
-    Ahat[ir2Ind, ir2Ind] = R2C2
-    Bhat[ir2Ind, 0] = (1 - R2C2)
+ # Exact discrete-time matrices for x = [SOC, h, V1, V2]^T
+    a_h = np.exp(-gamma * abs(I) * deltat / Q_As)
+    a1 = np.exp(-deltat / tau1)
+    a2 = np.exp(-deltat / tau2)
 
-    Ah = np.exp(-abs(I * G * deltat / (3600 * Q)))  # hysteresis factor
-    Ahat[hkInd, hkInd] = Ah
-    B = np.hstack((Bhat, 0 * Bhat))
-    Bhat[hkInd, 0] = -abs(G * deltat / (3600 * Q)) * Ah * (1 - np.sign(I) * xhat[hkInd, 0])
-    B[hkInd, 1] = Ah - 1
+    Ad = np.array([
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, a_h, 0.0, 0.0],
+        [0.0, 0.0, a1, 0.0],
+        [0.0, 0.0, 0.0, a2],
+    ], dtype=float)
 
-    # Step 1a: State estimate time update
-    xhat = Ahat @ xhat + B @ np.array([[I], [np.sign(I)]])
+    # Negative current = discharge current
+    Bd = np.array([
+        [deltat / Q_As],                    # SOC decreases when I < 0
+        [-gamma * deltat / Q_As],          # hysteresis moves toward discharge branch
+        [R1 * (1.0 - a1)],                 # V1 becomes negative during discharge
+        [R2 * (1.0 - a2)],                 # V2 becomes negative during discharge
+    ], dtype=float)
 
-    zk = xhat[zkInd, 0]
-    hk = xhat[hkInd, 0]
+    # State prediction
+    xhat_minus = Ad @ xhat + Bd * I
 
-    # Load the cell model parameters
-    Q = getPropECM('Qnom_Ah', model_props)
-    R1 = getParamECM('R_R1_Ohm', Tk, zk, model_params)
-    C1 = getParamECM('C_C1_F', Tk, zk, model_params)
-    R2 = getParamECM('R_R2_Ohm', Tk, zk, model_params)
-    C2 = getParamECM('C_C2_F', Tk, zk, model_params)
-    R0 = getParamECM('R_R0_Ohm', Tk, zk, model_params)
-    G = getParamECM('gamma', Tk, zk, model_params)
-   
+    # Bound physical states a little for robustness
+    xhat_minus[hInd, 0] = np.clip(xhat_minus[hInd, 0], -1.0, 1.0)
+    xhat_minus[socInd, 0] = np.clip(xhat_minus[socInd, 0], -0.05, 1.05)
 
-    R1C1 = np.exp(-deltat / (R1 * C1))
-    R2C2 = np.exp(-deltat / (R2 * C2))
+    soc_minus = float(xhat_minus[socInd, 0])
+    h_minus = float(xhat_minus[hInd, 0])
 
-    # Step 1b: Error covariance time update
-    # sigmaminus(k) = Ahat(k-1)*sigmaplus(k-1)*Ahat(k-1)' + ...
-    # Bhat(k-1)*sigmawtilde*Bhat(k-1)'
-    SigmaX = Ahat @ SigmaX @ Ahat.T + Bhat @ np.atleast_2d(SigmaW) @ Bhat.T if np.ndim(SigmaW) > 0 else Ahat @ SigmaX @ Ahat.T + Bhat * SigmaW * Bhat.T
+    # Recompute params at predicted SOC for output linearization
+    R0 = getParamECM("R_R0_Ohm", Tk, soc_minus, model_params)
+    R1 = getParamECM("R_R1_Ohm", Tk, soc_minus, model_params)
+    C1 = getParamECM("C_C1_F", Tk, soc_minus, model_params)
+    R2 = getParamECM("R_R2_Ohm", Tk, soc_minus, model_params)
+    C2 = getParamECM("C_C2_F", Tk, soc_minus, model_params)
+    gamma = getParamECM("gamma", Tk, soc_minus, model_params)
 
-    # Step 1c: Output estimate
-    OCVdch = getParamECM('E_OCV_dch_V', Tk, zk, model_params)
-    OCVch = getParamECM('E_OCV_ch_V', Tk, zk, model_params)
-    OCV = ((1+hk)/2)*OCVch + ((1-hk)/2)*OCVdch
-    yhat = (
-        OCV
-        - float(R1) * xhat[ir1Ind, 0]
-        - float(R2) * xhat[ir2Ind, 0]
-        - R0 * I
+    # Process covariance prediction
+    if np.ndim(SigmaW) == 0:
+        SigmaX = Ad @ SigmaX @ Ad.T + Bd * SigmaW * Bd.T
+    else:
+        SigmaX = Ad @ SigmaX @ Ad.T + Bd @ np.atleast_2d(SigmaW) @ Bd.T
+
+    # Nonlinear output prediction
+    OCV, OCVch, OCVdch = ocv_from_soc_h(soc_minus, h_minus, Tk, model_params)
+    yhat = OCV + R0 * I + float(xhat_minus[v1Ind, 0]) + float(xhat_minus[v2Ind, 0])
+
+    # EKF measurement Jacobian Ck = d g / d x
+    Ck = np.zeros((1, 4), dtype=float)
+    Ck[0, socInd] = (
+        0.5 * (1.0 + h_minus) * dOCVfromSOCtemp(soc_minus, Tk, model_params, "E_OCV_ch_V")
+        + 0.5 * (1.0 - h_minus) * dOCVfromSOCtemp(soc_minus, Tk, model_params, "E_OCV_dch_V")
     )
+    Ck[0, hInd] = 0.5 * (OCVch - OCVdch)
+    Ck[0, v1Ind] = 1.0
+    Ck[0, v2Ind] = 1.0
 
-    # Step 2a: Estimator gain matrix
-    Chat = np.zeros((1, nx))
-    Chat[0, zkInd] = dOCVfromSOCtemp(zk, Tk, model_params, 'E_OCV_ch_V') * (1+hk)/2 + dOCVfromSOCtemp(zk, Tk, model_params, 'E_OCV_dch_V') * (1-hk)/2
-    Chat[0, hkInd] = 0.5 * (OCVch - OCVdch)
-    Chat[0, ir1Ind] = -float(R1)
-    Chat[0, ir2Ind] = -float(R2)
+    # Direct-feedthrough from current in voltage equation
+    Dk = np.array([[R0]], dtype=float)
 
-    Dhat = 1
-    SigmaY = Chat @ SigmaX @ Chat.T + Dhat * SigmaV * Dhat
-    L = SigmaX @ Chat.T / SigmaY
+    # Innovation covariance
+    # Measurement noise is additive on voltage measurement, so noise feedthrough is 1
+    SigmaY = Ck @ SigmaX @ Ck.T + SigmaV
 
-    # Step 2b: State estimate measurement update
-    r = vk - yhat  # residual. Use to check for sensor errors...
-    if r**2 > 100 * SigmaY:
+    # Kalman gain
+    L = SigmaX @ Ck.T / SigmaY
+
+    # Measurement update
+    r = vk - yhat
+    if r**2 > 100.0 * SigmaY:
         L[:] = 0.0
-    xhat = xhat + L * r
-    xhat[hkInd, 0] = min(1, max(-1, xhat[hkInd, 0]))  # Help maintain robustness
-    xhat[zkInd, 0] = min(1.05, max(-0.05, xhat[zkInd, 0]))
 
-    # Step 2c: Error covariance measurement update (Joseph form)
-    I4 = np.eye(nx)
-    SigmaX = (I4 - L @ Chat) @ SigmaX @ (I4 - L @ Chat).T + L * SigmaV * L.T
+    xhat = xhat_minus + L * r
+    xhat[hInd, 0] = np.clip(xhat[hInd, 0], -1.0, 1.0)
+    xhat[socInd, 0] = np.clip(xhat[socInd, 0], -0.05, 1.05)
 
-    # % Q-bump code
-    if r**2 > 4 * SigmaY:  # bad voltage estimate by 2 std. devs, bump Q
-        print('Bumping SigmaX')
-        SigmaX[zkInd, zkInd] = SigmaX[zkInd, zkInd] * ekfData['Qbump']
+    # Joseph-form covariance update
+    I4 = np.eye(4)
+    SigmaX = (I4 - L @ Ck) @ SigmaX @ (I4 - L @ Ck).T + L * SigmaV * L.T
 
+    if r**2 > 4.0 * SigmaY:
+        print("Bumping SigmaX")
+        SigmaX[socInd, socInd] *= ekfData["Qbump"]
+
+    # Symmetrize covariance for robustness
     _, S, Vt = np.linalg.svd(SigmaX)
     V = Vt.T
     HH = V @ np.diag(S) @ V.T
-    SigmaX = (SigmaX + SigmaX.T + HH + HH.T) / 4  # Help maintain robustness
+    SigmaX = (SigmaX + SigmaX.T + HH + HH.T) / 4.0
 
-    # Save data in ekfData structure for next time...
-    ekfData['priorI'] = ik
-    ekfData['SigmaX'] = SigmaX
-    ekfData['xhat'] = xhat
+    ekfData["priorI"] = ik
+    ekfData["SigmaX"] = SigmaX
+    ekfData["xhat"] = xhat
 
-    zk = xhat[zkInd, 0]
-    zkbnd = 3 * np.sqrt(SigmaX[zkInd, zkInd])
+    soc_est = float(xhat[socInd, 0])
+    soc_bnd = 3.0 * np.sqrt(SigmaX[socInd, socInd])
 
-    return zk, zkbnd, ekfData
+    return soc_est, soc_bnd, ekfData
 
-# load CellModel % loads "model" of cell
-cell_props = 'Molicel_INR-21700-P45B_cellprops_2.2.csv'
-cell_params = 'Molicel_INR-21700-P45B_ECM_2.2.csv'
+
+# ---------------------------
+# Load model and data
+# ---------------------------
+
+cell_props = "Molicel_INR-21700-P45B_cellprops_2.2.csv"
+cell_params = "Molicel_INR-21700-P45B_ECM_2.2.csv"
 working_dir = os.getcwd()
-model_props = pd.read_csv(working_dir + '/' + cell_props) 
-model_params = pd.read_csv(working_dir + '/' + cell_params)
 
-# Load cell-test data. Contains variable "DYNData" of which the field
-# "script1" is of interest. It has sub-fields time, current, voltage, soc.
-data_file = 'MOLICEL_P45B_079_025degC_DC_WLTP_5C_Dch_1p5C_Ch_validation.csv'
-#data_file = 'MOLICEL-INR21700-P45B_019_Aging_Block_004_0.csv'
-#data_file = 'MOLICEL-INR21700-P45B_019_Aging_Block_004_0 - shortened.csv' 
-#data_file = 'MOLICEL-INR21700-P45B_019_Aging_Block_004_0 - shortened - shortened.csv'
-data = pd.read_csv(working_dir + '/' + data_file)  # loads data from cell test
+model_props = pd.read_csv(os.path.join(working_dir, cell_props))
+model_params = pd.read_csv(os.path.join(working_dir, cell_params))
 
-#downsample data for faster processing (optional)
+data_file = "MOLICEL-INR21700-P45B_019_Aging_Block_004_0 - shortened - shortened.csv"
+data_file = "MOLICEL-INR21700-P45B_019_Aging_Block_004_0 - shortened.csv"
+#data_file = "MOLICEL_P45B_079_025degC_DC_WLTP_5C_Dch_1p5C_Ch_validation.csv"
+data = pd.read_csv(os.path.join(working_dir, data_file))
+
+# Optional downsample
 data = data.iloc[::10, :].reset_index(drop=True)
 
-time = data['t_s'].to_numpy()
+time = data["t_s"].to_numpy()
 deltat = time[1] - time[0]
-time = time - time[0]  # start time at 0
-current = -data['I_exp_A'].to_numpy()  # flip current sign so discharge < 0; charge > 0.
-voltage = data['V_exp_V'].to_numpy()
-temperature = data['T_exp_degC'].to_numpy()
-soc = data['SOC'].to_numpy()
+time = time - time[0]
 
-# Reserve storage for computed results, for plotting
-sochat = np.zeros_like(soc)
-socbound = np.zeros_like(soc)
+# Keep your original current convention
+current = data["I_exp_A"].to_numpy()
+voltage = data["V_exp_V"].to_numpy()
+temperature = data["T_exp_degC"].to_numpy()
+soc_true = data["SOC"].to_numpy()
 
-# Covariance values
-SigmaX0 = np.diag([1e-3, 1e-3, 1e-3, 1e-2])  # uncertainty of initial state
-SigmaV = 2e-1  # uncertainty of voltage sensor, output equation
-SigmaW = 1e1  # uncertainty of current sensor, state equation
+sochat = np.zeros_like(soc_true)
+socbound = np.zeros_like(soc_true)
 
-# Create ekfData structure and initialize variables using first
-# voltage measurement and first temperature measurement
-ekfData = initEKF(soc[0], SigmaX0, SigmaV, SigmaW, model_params, model_props)
+# Covariances
+SigmaX0 = np.diag([1e-2, 1e-3, 1e-3, 1e-3])   # [SOC, h, V1, V2]
+SigmaV = 2e-1
+SigmaW = 1e1
 
-# Now, enter loop for remainder of time, where we update the EKF
-# once per sample interval
-# add progressbar
+ekfData = initEKF(soc_true[0], SigmaX0, SigmaV, SigmaW, model_params, model_props)
 
 for k in tqdm(range(len(voltage)), desc="Running EKF"):
-    vk = voltage[k]  # "measure" voltage
-    ik = current[k]  # "measure" current
-    Tk = temperature[k]  # "measure" temperature
-
-    # Update SOC (and other model states)
+    vk = voltage[k]
+    ik = current[k]
+    Tk = temperature[k]
     sochat[k], socbound[k], ekfData = iterEKF(vk, ik, Tk, deltat, ekfData)
 
+# ---------------------------
 # Plot results
+# ---------------------------
+
 plt.figure(1)
 plt.clf()
-plt.plot(time/60, 100*sochat, label='Estimate')
-plt.plot(time/60, 100*soc, label='Truth')
-plt.plot(time/60, 100*(sochat+socbound))
-plt.plot(time/60, 100*(sochat-socbound))
-plt.title('SOC estimation using EKF')
-plt.xlabel('Time (min)')
-plt.ylabel('SOC (%)')
-plt.legend(['Estimate','Truth','Bounds'])
+plt.plot(time / 60, 100 * sochat, label="Estimate")
+plt.plot(time / 60, 100 * soc_true, label="Truth")
+plt.plot(time / 60, 100 * (sochat + socbound))
+plt.plot(time / 60, 100 * (sochat - socbound))
+plt.title("SOC estimation using EKF")
+plt.xlabel("Time (min)")
+plt.ylabel("SOC (%)")
+plt.legend(["Estimate", "Truth", "Bounds"])
 plt.grid(True)
 
-print('RMS SOC estimation error = %g%%' %
-      np.sqrt(np.mean((100*(soc-sochat))**2)))
+print("RMS SOC estimation error = %g%%" % np.sqrt(np.mean((100 * (soc_true - sochat)) ** 2)))
 
 plt.figure(2)
 plt.clf()
-plt.plot(time/60, 100*(soc-sochat), label='Estimation error')
-plt.plot(time/60, 100*socbound)
-plt.plot(time/60, -100*socbound)
-plt.title('SOC estimation errors using EKF')
-plt.xlabel('Time (min)')
-plt.ylabel('SOC error (%)')
-plt.ylim([-4,4])
-plt.legend(['Estimation error','Bounds'])
+plt.plot(time / 60, 100 * (soc_true - sochat), label="Estimation error")
+plt.plot(time / 60, 100 * socbound)
+plt.plot(time / 60, -100 * socbound)
+plt.title("SOC estimation errors using EKF")
+plt.xlabel("Time (min)")
+plt.ylabel("SOC error (%)")
+plt.ylim([-4, 4])
+plt.legend(["Estimation error", "Bounds"])
 plt.grid(True)
 
-ind = np.where(np.abs(soc-sochat) > socbound)[0]
-print('Percent of time error outside bounds = %g%%' %
-      (len(ind)/len(soc)*100))
+ind = np.where(np.abs(soc_true - sochat) > socbound)[0]
+print("Percent of time error outside bounds = %g%%" % (len(ind) / len(soc_true) * 100))
 
 plt.show()
