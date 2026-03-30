@@ -141,7 +141,7 @@ def iterEKF(vk, ik, Tk, deltat, ekfData):
     Bhat = np.zeros((nx, 1))
 
     Ahat[zkInd, zkInd] = 1
-    Bhat[zkInd, 0] = -deltat / (3600 * Q)
+    Bhat[zkInd, 0] = deltat / (3600 * Q)
 
     Ahat[ir1Ind, ir1Ind] = R1C1
     Bhat[ir1Ind, 0] = (1 - R1C1)
@@ -153,7 +153,7 @@ def iterEKF(vk, ik, Tk, deltat, ekfData):
     Ahat[hkInd, hkInd] = Ah
     B = np.hstack((Bhat, 0 * Bhat))
     Bhat[hkInd, 0] = -abs(G * deltat / (3600 * Q)) * Ah * (1 - signIk * xhat[hkInd, 0])
-    B[hkInd, 1] = Ah - 1
+    B[hkInd, 1] = 1 - Ah
 
     # Step 1a: State estimate time update
     xhat = Ahat @ xhat + B @ np.array([[I], [signIk]])
@@ -184,17 +184,17 @@ def iterEKF(vk, ik, Tk, deltat, ekfData):
     OCV = ((1+hk)/2)*OCVch + ((1-hk)/2)*OCVdch
     yhat = (
         OCV
-        - float(R1) * xhat[ir1Ind, 0]
-        - float(R2) * xhat[ir2Ind, 0]
-        - R0 * ik
+        + float(R1) * xhat[ir1Ind, 0]
+        + float(R2) * xhat[ir2Ind, 0]
+        + R0 * ik
     )
 
     # Step 2a: Estimator gain matrix
     Chat = np.zeros((1, nx))
     Chat[0, zkInd] = dOCVfromSOCtemp(zk, Tk, model_params, 'E_OCV_ch_V') * (1+hk)/2 + dOCVfromSOCtemp(zk, Tk, model_params, 'E_OCV_dch_V') * (1-hk)/2
     Chat[0, hkInd] = 0.5 * (OCVch - OCVdch)
-    Chat[0, ir1Ind] = -float(R1)
-    Chat[0, ir2Ind] = -float(R2)
+    Chat[0, ir1Ind] = float(R1)
+    Chat[0, ir2Ind] = float(R2)
 
     Dhat = 1
     SigmaY = Chat @ SigmaX @ Chat.T + Dhat * SigmaV * Dhat
@@ -255,7 +255,7 @@ data = data.iloc[::5, :].reset_index(drop=True)
 time = data['t_s'].to_numpy()
 #deltat = time[1] - time[0]
 time = time - time[0]  # start time at 0
-current = -data['I_exp_A'].to_numpy()  # flip current sign so discharge is positive current and charge is negative current
+current = data['I_exp_A'].to_numpy()  # discharge < 0, charge > 0
 voltage = data['V_exp_V'].to_numpy()
 temperature = data['T_exp_degC'].to_numpy()
 soc = data['SOC'].to_numpy()
