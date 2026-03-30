@@ -20,7 +20,7 @@ def initEKF(SOC0, SigmaX0, SigmaV, SigmaW, model_params, model_props):
     V20 = 0.0
 
     # Optional initial SOC offset for testing
-    SOC0 = SOC0 - 0.1
+    #SOC0 = SOC0 - 0.1
 
     ekfData["xhat"] = np.array([SOC0, h0, V10, V20], dtype=float).reshape(-1, 1)
 
@@ -124,11 +124,6 @@ def iterEKF(vk, ik, Tk, deltat, ekfData):
     a1 = np.exp(-deltat / tau1)
     a2 = np.exp(-deltat / tau2)
 
- # Exact discrete-time matrices for x = [SOC, h, V1, V2]^T
-    a_h = np.exp(-gamma * abs(I) * deltat / Q_As)
-    a1 = np.exp(-deltat / tau1)
-    a2 = np.exp(-deltat / tau2)
-
     Ad = np.array([
         [1.0, 0.0, 0.0, 0.0],
         [0.0, a_h, 0.0, 0.0],
@@ -138,14 +133,21 @@ def iterEKF(vk, ik, Tk, deltat, ekfData):
 
     # Negative current = discharge current
     Bd = np.array([
-        [deltat / Q_As],                    # SOC decreases when I < 0
-        [-gamma * deltat / Q_As],          # hysteresis moves toward discharge branch
-        [R1 * (1.0 - a1)],                 # V1 becomes negative during discharge
-        [R2 * (1.0 - a2)],                 # V2 becomes negative during discharge
+        [deltat / Q_As],            # SOC decreases when I < 0
+        [0.0],                      # hysteresis uses explicit sign(I) branch forcing below
+        [R1 * (1.0 - a1)],          # V1 becomes negative during discharge
+        [R2 * (1.0 - a2)],          # V2 becomes negative during discharge
     ], dtype=float)
 
+    sign_I = np.sign(I)
+    if abs(I) < Q_Ah / 100.0:
+        sign_I = 0.0
+
+    Bh = np.zeros((4, 1), dtype=float)
+    Bh[hInd, 0] = a_h - 1.0
+
     # State prediction
-    xhat_minus = Ad @ xhat + Bd * I
+    xhat_minus = Ad @ xhat + Bd * I + Bh * sign_I
 
     # Bound physical states a little for robustness
     xhat_minus[hInd, 0] = np.clip(xhat_minus[hInd, 0], -1.0, 1.0)
@@ -183,7 +185,7 @@ def iterEKF(vk, ik, Tk, deltat, ekfData):
     Ck[0, v2Ind] = 1.0
 
     # Direct-feedthrough from current in voltage equation
-    Dk = np.array([[R0]], dtype=float)
+    Dk = 1
 
     # Innovation covariance
     # Measurement noise is additive on voltage measurement, so noise feedthrough is 1
@@ -218,12 +220,12 @@ def iterEKF(vk, ik, Tk, deltat, ekfData):
     ekfData["priorI"] = ik
     ekfData["SigmaX"] = SigmaX
     ekfData["xhat"] = xhat
+    ekfData["yhat"] = yhat
 
     soc_est = float(xhat[socInd, 0])
     soc_bnd = 3.0 * np.sqrt(SigmaX[socInd, socInd])
 
     return soc_est, soc_bnd, ekfData
-
 
 # ---------------------------
 # Load model and data
@@ -236,13 +238,13 @@ working_dir = os.getcwd()
 model_props = pd.read_csv(os.path.join(working_dir, cell_props))
 model_params = pd.read_csv(os.path.join(working_dir, cell_params))
 
-data_file = "MOLICEL-INR21700-P45B_019_Aging_Block_004_0 - shortened - shortened.csv"
+#data_file = "MOLICEL-INR21700-P45B_019_Aging_Block_004_0 - shortened - shortened.csv"
 data_file = "MOLICEL-INR21700-P45B_019_Aging_Block_004_0 - shortened.csv"
 #data_file = "MOLICEL_P45B_079_025degC_DC_WLTP_5C_Dch_1p5C_Ch_validation.csv"
 data = pd.read_csv(os.path.join(working_dir, data_file))
 
 # Optional downsample
-data = data.iloc[::10, :].reset_index(drop=True)
+data = data.iloc[::40, :].reset_index(drop=True)
 
 time = data["t_s"].to_numpy()
 deltat = time[1] - time[0]
@@ -259,16 +261,20 @@ socbound = np.zeros_like(soc_true)
 
 # Covariances
 SigmaX0 = np.diag([1e-2, 1e-3, 1e-3, 1e-3])   # [SOC, h, V1, V2]
-SigmaV = 2e-1
-SigmaW = 1e1
+SigmaV = 2e-2 #Sensor noise variance (voltage measurement noise)
+SigmaW = 1e-1 #Process noise variance (model uncertainty, unmodeled dynamics, etc.)
 
 ekfData = initEKF(soc_true[0], SigmaX0, SigmaV, SigmaW, model_params, model_props)
 
+v_errs = []
 for k in tqdm(range(len(voltage)), desc="Running EKF"):
     vk = voltage[k]
     ik = current[k]
     Tk = temperature[k]
     sochat[k], socbound[k], ekfData = iterEKF(vk, ik, Tk, deltat, ekfData)
+
+    #voltage error
+    v_errs.append(vk - ekfData["yhat"])
 
 # ---------------------------
 # Plot results
@@ -303,4 +309,15 @@ plt.grid(True)
 ind = np.where(np.abs(soc_true - sochat) > socbound)[0]
 print("Percent of time error outside bounds = %g%%" % (len(ind) / len(soc_true) * 100))
 
+plt.show()
+
+#plot voltage errors
+plt.figure(3)
+plt.clf()
+plt.plot(time / 60, v_errs, label="Voltage error")
+plt.title("Voltage estimation errors using EKF")
+plt.xlabel("Time (min)")
+plt.ylabel("Voltage error (V)")
+plt.legend()
+plt.grid(True)
 plt.show()
